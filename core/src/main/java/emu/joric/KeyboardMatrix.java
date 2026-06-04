@@ -1,8 +1,6 @@
 package emu.joric;
 
-import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.List;
 import java.util.TreeMap;
 
 import com.badlogic.gdx.InputAdapter;
@@ -144,10 +142,18 @@ public abstract class KeyboardMatrix extends InputAdapter {
     private long minKeyReleaseTimes[] = new long[512];
     
     /**
-     * Holds a queue of keycodes whose key release processing has been delayed. This is
-     * supported primarily for use with the Android virtual keyboard on some devices, 
-     * where the key pressed and release both get fired on release of the key, so have
-     * virtually no time between them.
+     * Holds a queue of keycodes whose key release processing has been delayed.
+     * The queue serves two purposes; see {@link #keyUp} for the full rationale:
+     *   1. Originally supported for the Android virtual keyboard on some devices,
+     *      where keyDown and keyUp both fire on key release with virtually no
+     *      time between them. Without queueing, the matrix bit would be set and
+     *      cleared between two consecutive ROM keyboard scans and the Oric would
+     *      never see the press.
+     *   2. Also used to preserve physical-release order when a slow-hold release
+     *      lands while a fast-tap release is still queued, by routing both
+     *      through the queue and draining it at one entry per render frame.
+     * The TreeMap is keyed by the wall-clock time at which the entry becomes
+     * eligible for dequeue.
      */
     private TreeMap<Long, Integer> delayedReleaseKeys = new TreeMap<Long, Integer>();
     
@@ -193,30 +199,46 @@ public abstract class KeyboardMatrix extends InputAdapter {
 
     public boolean keyUp(int keycode) {
         if (!keyConvHashMap.containsKey(keycode)) return false;
-        
+
         if (keycode != 0) {
             long currentTime = TimeUtils.nanoTime();
             long minKeyReleaseTime = minKeyReleaseTimes[keycode];
             minKeyReleaseTimes[keycode] = 0;
-            
-            if (currentTime < minKeyReleaseTime) {
-                // Key hasn't been down long enough (possibly due to it being an Android virtual 
-                // keyboard or something similar that doesn't reflect the actual time the key 
-                // is down), so let's add this keycode to the delayed release list.
-                synchronized(delayedReleaseKeys) {
-                    delayedReleaseKeys.put(minKeyReleaseTime, keycode);
+
+            // Defer the release via the queue in either of two cases:
+            //   1. The hold was shorter than 50ms (the original Android-virtual-
+            //      keyboard reason -- see the field comment on delayedReleaseKeys).
+            //      Without this, keyboards that fire keyDown and keyUp essentially
+            //      simultaneously would set and clear the matrix bit between two
+            //      consecutive ROM keyboard scans, so the Oric never sees the press.
+            //   2. The queue is already non-empty. If we processed this release
+            //      immediately while a queued release for some other key is still
+            //      pending, the emulator would see the releases out of physical
+            //      order -- the matrix bit for *this* key would clear before the
+            //      bit for the earlier-released key. Queueing this one too keeps
+            //      release order consistent. Combined with the one-per-frame
+            //      drain in checkDelayedReleaseKeys, this also avoids a burst of
+            //      matrix-bit clears all landing in a single frame, which would
+            //      leave no visibility window between consecutive releases for
+            //      the ROM to scan.
+            boolean queueNonEmpty;
+            synchronized (delayedReleaseKeys) {
+                queueNonEmpty = !delayedReleaseKeys.isEmpty();
+            }
+
+            if (currentTime < minKeyReleaseTime || queueNonEmpty) {
+                // Case 1: queue at the original 50ms-after-keyDown deadline so the
+                // matrix bit is held long enough for a ROM scan to observe it.
+                // Case 2: queue at the physical release time (already in the past),
+                // making the entry immediately eligible -- it sits in the queue only
+                // to preserve order behind earlier releases.
+                long releaseTime = (currentTime < minKeyReleaseTime) ? minKeyReleaseTime : currentTime;
+                synchronized (delayedReleaseKeys) {
+                    delayedReleaseKeys.put(releaseTime, keycode);
                 }
-                
+
             } else {
-                // Otherwise we process the release by updating the key matrix that the Oric polls.
-                int keyDetails[] = (int[]) keyConvHashMap.get(new Integer(keycode));
-                if (keyDetails != null) {
-                    int currentRowValue = getKeyMatrixRow(keyDetails[1]);
-                    setKeyMatrixRow(keyDetails[1], currentRowValue & ~keyDetails[2]);
-                } else {
-                    // Special keycodes.
-        
-                }
+                clearMatrixBitFor(keycode);
             }
         }
 
@@ -252,23 +274,46 @@ public abstract class KeyboardMatrix extends InputAdapter {
     }
     
     /**
-     * Checks if there are any keys whose release processed has been delayed that
-     * are now able to be processed due to the minimum release time having been
-     * passed.
+     * Checks if there are any keys whose release processing has been delayed and
+     * are now eligible to be processed. Processes at most one eligible release
+     * per call (= one per render frame), even if several entries are eligible at
+     * once -- e.g. several queued releases all past their deadline. Processing
+     * them all in the same frame would clear their matrix bits simultaneously,
+     * leaving no gap during which the Oric ROM's keyboard scan could observe each
+     * intermediate state; spacing them out by one frame each gives every
+     * transition its own visibility window.
+     *
+     * Releases must be applied here via {@link #clearMatrixBitFor}, not via
+     * {@link #keyUp} -- a recursive keyUp would see the queue still non-empty
+     * (case 2 in keyUp's comment) and re-queue rather than clear.
      */
     public void checkDelayedReleaseKeys() {
         if (!delayedReleaseKeys.isEmpty()) {
             synchronized (delayedReleaseKeys) {
-                List<Long> processedReleases = new ArrayList<Long>();
-                processedReleases.addAll(delayedReleaseKeys.headMap(TimeUtils.nanoTime()).keySet());
-                for (Long keyReleaseTime : processedReleases) {
-                    int delayedReleaseKeyCode = delayedReleaseKeys.remove(keyReleaseTime);
-                    keyUp(delayedReleaseKeyCode);
+                if (!delayedReleaseKeys.isEmpty()) {
+                    Long firstKey = delayedReleaseKeys.firstKey();
+                    if (firstKey.longValue() < TimeUtils.nanoTime()) {
+                        int delayedReleaseKeyCode = delayedReleaseKeys.remove(firstKey);
+                        clearMatrixBitFor(delayedReleaseKeyCode);
+                    }
                 }
             }
         }
     }
-    
+
+    /**
+     * Clears the matrix bit for the given keycode -- shared by the
+     * immediate-release path in {@link #keyUp} and the deferred-release path in
+     * {@link #checkDelayedReleaseKeys}. No-op if the keycode has no mapping.
+     */
+    private void clearMatrixBitFor(int keycode) {
+        int keyDetails[] = (int[]) keyConvHashMap.get(new Integer(keycode));
+        if (keyDetails != null) {
+            int currentRowValue = getKeyMatrixRow(keyDetails[1]);
+            setKeyMatrixRow(keyDetails[1], currentRowValue & ~keyDetails[2]);
+        }
+    }
+
     public abstract int getKeyMatrixRow(int row);
     
     public abstract void setKeyMatrixRow(int row, int value);
