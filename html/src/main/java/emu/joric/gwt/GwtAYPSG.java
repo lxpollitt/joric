@@ -45,16 +45,32 @@ public class GwtAYPSG implements AYPSG {
     private double cyclesPerSample;
     private int sampleLatency;
     
-    // Not entirely sure what these volume levels should be. With LEVEL_DIVISOR set
-    // to 4, and volumes A, B, and C all at 15, then max sample is at 32760, which 
-    // is just under the limit.
-    private final static int LEVEL_DIVISOR = 4;
-    private final static int[] VOLUME_LEVELS = { 
-            0x0000 / LEVEL_DIVISOR, 0x0055 / LEVEL_DIVISOR, 0x0079 / LEVEL_DIVISOR,
-            0x00AB / LEVEL_DIVISOR, 0x00F1 / LEVEL_DIVISOR, 0x0155 / LEVEL_DIVISOR, 0x01E3 / LEVEL_DIVISOR,
-            0x02AA / LEVEL_DIVISOR, 0x03C5 / LEVEL_DIVISOR, 0x0555 / LEVEL_DIVISOR, 0x078B / LEVEL_DIVISOR,
-            0x0AAB / LEVEL_DIVISOR, 0x0F16 / LEVEL_DIVISOR, 0x1555 / LEVEL_DIVISOR, 0x1E2B / LEVEL_DIVISOR,
-            0x2AAA / LEVEL_DIVISOR };
+    // DAC output voltages for each of the 16 fixed amplitude levels, as bench
+    // measured on a real AY chip by Matthew Westcott in December 2001 (posted
+    // to comp.sys.sinclair and placed in the public domain by him). The audio
+    // amplitude of each level is its voltage swing above the level 0 baseline.
+    // Note the non-uniform steps, e.g. the near-equal levels 7 and 8, which
+    // are characteristic of the real DAC.
+    private static final double[] MEASURED_DAC_VOLTAGES = {
+            1.147, 1.162, 1.169, 1.178, 1.192, 1.213, 1.238, 1.299,
+            1.336, 1.457, 1.573, 1.707, 1.882, 2.060, 2.320, 2.580 };
+
+    // The maximum volume level value is chosen so that with volumes A, B and
+    // C all at 15, the max sample is at 32760, which is just under the limit.
+    private static final int MAX_VOLUME_LEVEL = 0x2AAA / 4;
+
+    private static final int[] VOLUME_LEVELS = buildVolumeLevels();
+
+    private static int[] buildVolumeLevels() {
+        int[] levels = new int[16];
+        double baseline = MEASURED_DAC_VOLTAGES[0];
+        double range = MEASURED_DAC_VOLTAGES[15] - baseline;
+        for (int i = 0; i < 16; i++) {
+            levels[i] = (int) Math.round(
+                    ((MEASURED_DAC_VOLTAGES[i] - baseline) / range) * MAX_VOLUME_LEVEL);
+        }
+        return levels;
+    }
 
     // Constants for index values into output, count, and period arrays.
     private static final int A = 0;
