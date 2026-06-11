@@ -175,6 +175,14 @@ public class GwtAYPSG implements AYPSG {
     private float dcBlockerX1;
     private float dcBlockerY1;
 
+    // Diagnostic flag. When false, the DC blocker is bypassed and the raw chip
+    // sample is sent to the AudioWorklet directly, mapped to [0, 1] so silence
+    // sits at 0 and any DC offset is clearly visible in the captured waveform.
+    // Default true; flip to false when investigating click/transient behaviour
+    // to see the chip's actual output separately from what the DC blocker does
+    // to it.
+    private static final boolean DC_BLOCKER_ENABLED = true;
+    
     // TODO: Remove these after debugging timing issue.
     private long cycleCount;
     private long startTime;
@@ -695,21 +703,31 @@ public class GwtAYPSG implements AYPSG {
                            lerp(MIX_TABLE[ia | ib], MIX_TABLE[ia | ib | ic], wC), wB);
         int sample = (int) lerp(aLow, aHigh, wA);
 
-        // Use a simple DC blocker to convert to -1.0 to 1.0, which is what the
-        // AudioWorkletProcessor needs. The output clamp is folded into the same
-        // expression as the filter, so on the rare transient that hits the rail
-        // (e.g. a register write flipping the chip from full silence to full output
-        // in one sample), the clamped value is what gets fed back into the filter
-        // state. (Clamping the filter state is arguably less mathematically accurate,
-        // because the clamping behaviour is non-linear. But this approach brings us
-        // out of the clipping state and into more normal behaviour faster, and is
-        // likely a closer approximation of the original hardware circuit bahaviour.)
-        float x = sample / 16384.0f;
-        float y = Math.max(-1f, Math.min(1f,
-                        x - dcBlockerX1 + dcBlockerR * dcBlockerY1));
-        dcBlockerX1 = x;
-        dcBlockerY1 = y;
-        sampleBuffer.set(sampleBufferOffset, y);
+        if (DC_BLOCKER_ENABLED) {
+            // Use a simple DC blocker to convert to -1.0 to 1.0, which is what the
+            // AudioWorkletProcessor needs. The output clamp is folded into the same
+            // expression as the filter, so on the rare transient that hits the rail
+            // (e.g. a register write flipping the chip from full silence to full output
+            // in one sample), the clamped value is what gets fed back into the filter
+            // state. (Clamping the filter state is arguably less mathematically accurate,
+            // because the clamping behaviour is non-linear. But this approach brings us
+            // out of the clipping state and into more normal behaviour faster, and is
+            // likely a closer approximation of the original hardware circuit bahaviour.)
+            float x = sample / 16384.0f;
+            float y = Math.max(-1f, Math.min(1f,
+                            x - dcBlockerX1 + dcBlockerR * dcBlockerY1));
+            dcBlockerX1 = x;
+            dcBlockerY1 = y;
+            sampleBuffer.set(sampleBufferOffset, y);
+        } else {
+            // DC blocker bypassed. Map the raw chip sample [0, 0x7FFF] to [0, 1]
+            // so silence sits at the zero rail and any DC offset shows up as a
+            // positive shift in the captured waveform. Note: this leaves the audio
+            // signal DC-biased (it never goes negative), which is fine for waveform
+            // capture / inspection but may sound thump-y on transitions and may
+            // load the speaker coil more than usual. Use only for diagnostic runs.
+            sampleBuffer.set(sampleBufferOffset, sample / 32767.0f);
+        }
 
         // Increment total sample count, so that we can keep in sync with cycle count.
         sampleCount++;
